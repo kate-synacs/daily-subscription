@@ -35,6 +35,7 @@ services:
       PLATFORM_APP_ID: ${PLATFORM_APP_ID:-APP_000123}
       PLATFORM_PASSWORD: ${PLATFORM_PASSWORD:-change_me}
       PLATFORM_BASE_URL: ${PLATFORM_BASE_URL:-http://platform-mock:8080}
+      SHORTCODE: ${SHORTCODE:-tel:1234}
       DAILY_FEE: ${DAILY_FEE:-5.00}
       CURRENCY: ${CURRENCY:-XTS}
     ports:

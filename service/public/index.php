@@ -5,24 +5,51 @@ declare(strict_types=1);
 require __DIR__ . '/../vendor/autoload.php';
 
 use App\Config\Config;
+use App\Exception\BadRequestException;
 use App\Exception\DomainException;
 use App\Exception\MethodNotAllowedException;
 use App\Exception\NotFoundException;
+use App\Exception\PlatformException;
+use App\Http\Controller\OptInController;
+use App\Http\Controller\StatusController;
 use App\Http\Request;
 use App\Http\Response;
+use App\Platform\PlatformClient;
+use App\Repository\PdoFactory;
+use App\Repository\SubscriberRepository;
+use App\Service\OptInService;
+use App\Service\StatusService;
 use FastRoute\Dispatcher;
 use FastRoute\RouteCollector;
+use GuzzleHttp\Client as GuzzleClient;
+use Monolog\Handler\StreamHandler;
+use Monolog\Logger;
 
-// Fail fast at bootstrap if DB config is missing. Platform credentials are
-// deliberately not defaulted here — they are required from the environment
-// when the platform client is used in later iterations.
-Config::validateRequired('DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD');
+// Bootstrap: Config's constructor fails fast on missing DB_* / platform credentials.
+$config = new Config();
+$pdo = PdoFactory::fromEnv();
+$log = new Logger('daily-pass');
+$log->pushHandler(new StreamHandler('php://stderr', Logger::INFO));
+$platform = new PlatformClient($config, new GuzzleClient(), $log);
+$subscribers = new SubscriberRepository($pdo);
+$optInController = new OptInController(new OptInService($pdo, $subscribers, $platform));
+$statusController = new StatusController(new StatusService($pdo));
 
 $defineRoutes = require __DIR__ . '/../src/Http/routes.php';
 
-$dispatcher = FastRoute\simpleDispatcher(static function (RouteCollector $r) use ($defineRoutes): void {
-    $defineRoutes($r);
-});
+$dispatcher = FastRoute\simpleDispatcher(
+    static function (RouteCollector $r) use ($defineRoutes, $optInController, $statusController): void {
+        $handlers = [
+            'health' => static fn (Request $req): Response => Response::json(200, [
+                'ok' => true,
+                'service' => 'service',
+            ]),
+            'optIn' => static fn (Request $req): Response => $optInController->handle($req),
+            'status' => static fn (Request $req): Response => $statusController->handle($req),
+        ];
+        $defineRoutes($r, $handlers);
+    }
+);
 
 $request = Request::fromGlobals();
 $routeInfo = $dispatcher->dispatch($request->method, $request->path);
@@ -36,16 +63,11 @@ try {
         case Dispatcher::FOUND:
             $handler = $routeInfo[1];
             $vars = $routeInfo[2] ?? [];
-            $req = $request->withParams($vars);
-            $result = $handler($req);
-            if ($result instanceof Response) {
-                $response = $result;
-            } elseif (is_array($result)) {
-                $response = Response::json(200, $result);
-            } else {
+            $result = $handler($request->withParams($vars));
+            if (!$result instanceof Response) {
                 throw new \RuntimeException('Invalid handler result');
             }
-            $response->emit();
+            $result->emit();
             break;
         default:
             throw new \RuntimeException('Routing failure');
@@ -56,22 +78,32 @@ try {
     }
     Response::json(405, [
         'ok' => false,
-        'error' => ['code' => 'method_not_allowed', 'message' => 'Method not allowed'],
+        'error' => ['code' => 'METHOD_NOT_ALLOWED', 'message' => 'Method not allowed'],
     ])->emit();
 } catch (NotFoundException $e) {
     Response::json(404, [
         'ok' => false,
-        'error' => ['code' => 'not_found', 'message' => 'Not found'],
+        'error' => ['code' => 'NOT_FOUND', 'message' => $e->getMessage()],
     ])->emit();
-} catch (DomainException $e) {
-    // More specific mapping will be added in later iterations.
+} catch (BadRequestException $e) {
     Response::json(400, [
         'ok' => false,
-        'error' => ['code' => 'bad_request', 'message' => $e->getMessage()],
+        'error' => ['code' => 'BAD_REQUEST', 'message' => $e->getMessage()],
     ])->emit();
-} catch (Throwable $e) {
+} catch (PlatformException $e) {
+    Response::json(502, [
+        'ok' => false,
+        'error' => ['code' => 'PLATFORM_ERROR', 'message' => $e->getMessage()],
+    ])->emit();
+} catch (DomainException $e) {
+    Response::json(400, [
+        'ok' => false,
+        'error' => ['code' => 'BAD_REQUEST', 'message' => $e->getMessage()],
+    ])->emit();
+} catch (Throwable) {
+    // Never leak stack traces or SQL to the client.
     Response::json(500, [
         'ok' => false,
-        'error' => ['code' => 'internal_error', 'message' => 'Internal server error'],
+        'error' => ['code' => 'INTERNAL_ERROR', 'message' => 'Internal server error'],
     ])->emit();
 }

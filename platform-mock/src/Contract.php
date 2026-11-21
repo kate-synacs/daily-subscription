@@ -27,13 +27,24 @@ final class Contract
             && is_string($subscriberId)
             && preg_match('/^tel:\d+$/', $subscriberId) === 1;
 
-        return [
+        $response = [
             'version' => '1.0',
             'requestId' => (string) (int) (microtime(true) * 1000),
             'statusCode' => 'S1000',
             'statusDetail' => $valid ? 'SUCCESS' : 'INVALID_REQUEST',
             'subscriptionStatus' => $valid && $action === '1' ? 'REGISTERED' : 'UNREGISTERED',
         ];
+
+        $state = $this->state->load();
+        $state['subscriptions'][] = [
+            'action' => is_string($action) ? $action : '',
+            'subscriberId' => is_string($subscriberId) ? $subscriberId : '',
+            'statusCode' => $response['statusCode'],
+            'at' => gmdate('c'),
+        ];
+        $this->state->save($state);
+
+        return $response;
     }
 
     /**

@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 use FastRoute\RouteCollector;
 
-return static function (RouteCollector $r): void {
-    $r->addRoute('GET', '/health', static function (): array {
-        return ['ok' => true, 'service' => 'service'];
-    });
+/**
+ * @param array<string, callable(App\Http\Request): App\Http\Response> $handlers
+ */
+return static function (RouteCollector $r, array $handlers): void {
+    $r->addRoute('GET', '/health', $handlers['health']);
+    $r->addRoute('POST', '/subscribers/opt-in', $handlers['optIn']);
+    $r->addRoute('GET', '/subscribers/{subscriberId}', $handlers['status']);
 };

@@ -54,6 +54,10 @@ switch ($route) {
         [$status, $payload] = $control->reset();
         $respond($status, $payload);
 
+    case 'GET /_log/subscriptions':
+        $current = $state->load();
+        $respond(200, is_array($current['subscriptions'] ?? null) ? $current['subscriptions'] : []);
+
     case 'GET /_log/sms':
         $current = $state->load();
         $respond(200, is_array($current['sms'] ?? null) ? $current['sms'] : []);
