@@ -2,50 +2,38 @@
 
 declare(strict_types=1);
 
-$host = getenv('DB_HOST') ?: 'db';
-$port = getenv('DB_PORT') ?: '5432';
-$name = getenv('DB_NAME') ?: 'dailypass';
-$user = getenv('DB_USER') ?: 'dailypass';
-$password = getenv('DB_PASSWORD') ?: '';
-$dsn = sprintf('pgsql:host=%s;port=%s;dbname=%s', $host, $port, $name);
+require __DIR__ . '/../vendor/autoload.php';
 
-$options = [
-    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-];
+use App\Repository\PdoFactory;
 
+// Wait for the DB with a retry loop (no fixed startup sleep guess).
 $pdo = null;
-$attempts = 60;
-for ($i = 0; $i < $attempts; $i++) {
+$maxAttempts = 120;
+for ($i = 0; $i < $maxAttempts; $i++) {
     try {
-        $pdo = new PDO($dsn, $user, $password, $options);
+        $candidate = PdoFactory::fromEnv();
+        $candidate->query('SELECT 1');
+        $pdo = $candidate;
         break;
     } catch (Throwable $e) {
-        if ($i === $attempts - 1) {
-            fwrite(STDERR, "DB not ready after {$attempts} attempts: {$e->getMessage()}\n");
+        if ($i === $maxAttempts - 1) {
+            fwrite(STDERR, "DB not ready after {$maxAttempts} attempts: {$e->getMessage()}\n");
             exit(1);
         }
+        // Short backoff between connection attempts, part of the retry loop.
         usleep(500000);
     }
 }
 
-$pdo->exec('CREATE TABLE IF NOT EXISTS schema_migrations (filename VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())');
-
-$migrationsDir = __DIR__ . '/../migrations';
-$files = glob($migrationsDir . '/*.sql') ?: [];
+// Apply every migrations/*.sql file in lexical order. Each file is one atomic
+// transaction; SQL uses IF NOT EXISTS so re-running on a migrated DB is a no-op.
+$files = glob(__DIR__ . '/../migrations/*.sql') ?: [];
 sort($files, SORT_STRING);
 
 foreach ($files as $file) {
-    $filename = basename($file);
-    $stmt = $pdo->prepare('SELECT 1 FROM schema_migrations WHERE filename = ?');
-    $stmt->execute([$filename]);
-    if ($stmt->fetchColumn()) {
-        continue;
-    }
-
     $sql = file_get_contents($file);
     if ($sql === false) {
-        fwrite(STDERR, "Failed to read migration: {$filename}\n");
+        fwrite(STDERR, "Failed to read migration: {$file}\n");
         exit(1);
     }
 
@@ -54,13 +42,14 @@ foreach ($files as $file) {
         if (trim($sql) !== '') {
             $pdo->exec($sql);
         }
-        $insert = $pdo->prepare('INSERT INTO schema_migrations (filename) VALUES (?)');
-        $insert->execute([$filename]);
         $pdo->commit();
-        fwrite(STDOUT, "Applied migration: {$filename}\n");
+        fwrite(STDOUT, 'Applied migration: ' . basename($file) . "\n");
     } catch (Throwable $e) {
-        $pdo->rollBack();
-        fwrite(STDERR, "Migration failed {$filename}: {$e->getMessage()}\n");
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        fwrite(STDERR, "Migration failed {$file}: {$e->getMessage()}\n");
+        // Fail the container: the entrypoint must not start php -S.
         exit(1);
     }
 }

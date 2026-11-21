@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/../vendor/autoload.php';
 
+use App\Config\Config;
 use App\Exception\DomainException;
 use App\Exception\MethodNotAllowedException;
 use App\Exception\NotFoundException;
@@ -11,6 +12,11 @@ use App\Http\Request;
 use App\Http\Response;
 use FastRoute\Dispatcher;
 use FastRoute\RouteCollector;
+
+// Fail fast at bootstrap if DB config is missing. Platform credentials are
+// deliberately not defaulted here — they are required from the environment
+// when the platform client is used in later iterations.
+Config::validateRequired('DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD');
 
 $defineRoutes = require __DIR__ . '/../src/Http/routes.php';
 

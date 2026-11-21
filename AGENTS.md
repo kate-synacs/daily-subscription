@@ -51,3 +51,12 @@ These are non-negotiable. If you deviate, stop and ask.
 
 ## First iteration (do this first, then stop)
 Read `docs/ASSIGNMENT.md` and this file. Produce a numbered plan of iterations (max 8). Do not write code. Wait for approval.
+
+## File hygiene
+- `opencode.json` lives ONLY at the repo root. Never create `opencode.json`
+  inside `service/` or `platform-mock/`.
+- Never overwrite `composer.json` with non-composer content. Before every build,
+  sanity-check: each `composer.json` must start with `"name":` and contain
+  `autoload.psr-4` for the app namespace (`App\\` in service, `Mock\\` in mock).
+- If a class is referenced with `use App\...`, the file must exist at the matching
+  PSR-4 path. Do not reference classes that do not exist yet.
