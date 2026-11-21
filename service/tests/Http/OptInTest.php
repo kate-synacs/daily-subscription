@@ -80,8 +80,35 @@ final class OptInTest extends HttpTestCase
 
     public function test_opt_in_platform_error_maps_to_502(): void
     {
-        // The mock has no forced-error control for /subscription/send (only for
-        // /caas/direct/debit), so this mapping cannot be exercised end-to-end yet.
-        self::markTestSkipped('mock cannot force /subscription/send to fail');
+        $msisdn = 'tel:1000000099';
+        $this->forceSubscriptionMode('E1308');
+
+        [$status] = $this->post('/subscribers/opt-in', ['subscriberId' => $msisdn]);
+
+        self::assertSame(502, $status);
+
+        $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM subscribers WHERE id = ?');
+        $stmt->execute([$msisdn]);
+        self::assertSame(0, (int) $stmt->fetchColumn(), 'subscriber must not be created when the platform call fails');
+    }
+
+    public function test_opt_in_transport_error_maps_to_502(): void
+    {
+        $this->forceSubscriptionMode('transport');
+
+        [$status] = $this->post('/subscribers/opt-in', ['subscriberId' => 'tel:1000000098']);
+
+        self::assertSame(502, $status);
+    }
+
+    private function forceSubscriptionMode(string $mode): void
+    {
+        $client = new \GuzzleHttp\Client([
+            'base_uri'    => getenv('MOCK_URL') ?: 'http://platform-mock:8080',
+            'http_errors' => false,
+            'timeout'     => 10,
+        ]);
+
+        $client->post('/_control/subscription-status', ['json' => ['mode' => $mode]]);
     }
 }

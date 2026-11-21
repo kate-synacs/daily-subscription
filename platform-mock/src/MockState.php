@@ -69,6 +69,7 @@ final class MockState
     {
         return [
             'mode' => 'S1000',
+            'subscriptionMode' => 'S1000',
             'seenExternalTrxIds' => [],
             'subscriptions' => [],
             'sms' => [],

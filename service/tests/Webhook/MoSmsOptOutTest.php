@@ -10,16 +10,6 @@ final class MoSmsOptOutTest extends ChargeTestCase
 {
     private const SUBSCRIBER = 'tel:1000000020';
 
-    protected function setUp(): void
-    {
-        parent::setUp();
-        $this->pdo->exec(
-            "DELETE FROM sms_log WHERE subscriber_id = '" . self::SUBSCRIBER . "';
-             DELETE FROM charge_attempts WHERE subscriber_id = '" . self::SUBSCRIBER . "';
-             DELETE FROM subscribers WHERE id = '" . self::SUBSCRIBER . "';"
-        );
-    }
-
     public function test_stop_opts_out_known_subscriber(): void
     {
         $this->setDebitMode('S1000');

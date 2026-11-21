@@ -34,6 +34,16 @@ switch ($route) {
         $respond(200, ['ok' => true, 'service' => 'platform-mock']);
 
     case 'POST /subscription/send':
+        $subscriptionMode = $state->load()['subscriptionMode'] ?? 'S1000';
+
+        if ($subscriptionMode === 'transport') {
+            $respond(500, ['error' => 'forced_transport_failure']);
+        }
+
+        if ($subscriptionMode !== 'S1000') {
+            $respond(200, ['statusCode' => $subscriptionMode, 'statusDetail' => 'Forced failure']);
+        }
+
         $respond(200, $contract->subscriptionSend($body));
 
     case 'POST /sms/send':
@@ -44,6 +54,10 @@ switch ($route) {
 
     case 'POST /_control/debit-status':
         [$status, $payload] = $control->debitStatus($body);
+        $respond($status, $payload);
+
+    case 'POST /_control/subscription-status':
+        [$status, $payload] = $control->subscriptionStatus($body);
         $respond($status, $payload);
 
     case 'POST /_control/push-callback':

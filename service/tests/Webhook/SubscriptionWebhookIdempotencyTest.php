@@ -9,13 +9,6 @@ use PDO;
 
 final class SubscriptionWebhookIdempotencyTest extends HttpTestCase
 {
-    protected function setUp(): void
-    {
-        parent::setUp();
-        $this->pdo->exec("DELETE FROM subscribers WHERE id IN ('tel:1000000009', 'tel:9999999998')");
-        $this->pdo->exec('TRUNCATE processed_webhook_events');
-    }
-
     public function test_registered_creates_active_subscriber(): void
     {
         [$status, $body] = $this->webhook('tel:1000000009', 'REGISTERED', '2026-11-21T10:00:00Z');

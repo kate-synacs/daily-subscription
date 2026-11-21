@@ -1,6 +1,7 @@
 {
   "name": "daily-pass/platform-mock",
   "type": "project",
+  "license": "MIT",
   "require": {
     "php": ">=8.3",
     "guzzlehttp/guzzle": "^7.9",

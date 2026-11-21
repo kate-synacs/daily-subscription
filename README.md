@@ -7,24 +7,55 @@ charged at most once per UTC billing day; `STOP` opts out immediately.
 
 Docker + Docker Compose. **Nothing else** — no local PHP, Composer or Postgres.
 
+## Layout
+
+- `service/` — the subscription service: `src/` (HTTP, services, repositories, platform client, clock), `migrations/` (plain SQL), `tests/` (PHPUnit).
+- `platform-mock/` — the fake operator: `public/index.php` (single front controller), `src/` (contract handlers, state and admin controls).
+- `docs/ASSIGNMENT.md` — the full task and Platform API contract.
+- `AGENTS.md` — working agreement and hard money-path rules.
+- `DECISIONS.md` — the reasoning behind the design; trade-offs and known gaps live there.
+
 ## Setup (clean machine)
 
 ```bash
 cp .env.example .env
-docker compose up
+docker compose up -d
 ```
+
+To watch the service logs: `docker compose logs -f service` (optional).
 
 `service/entrypoint.sh` waits for Postgres with a retry loop, applies
 `service/migrations/*.sql` in lexical order, then starts `php -S`. No manual
-migration step. The platform mock is stateful in `/tmp/mock-state.json` inside
-its container; `POST /_control/reset` gives a clean demo state.
+migration step. Trade-offs and known gaps live in `DECISIONS.md`.
 
 Service: `http://localhost:8080` · mock: `http://localhost:8081`
 
+## Driving the mock
+
+The mock is a controllable fake operator. Its state lives in
+`/tmp/mock-state.json` inside the container; `POST /_control/reset` clears
+logs, seen trx ids and both modes.
+
+| Endpoint | What it does |
+|---|---|
+| `POST /_control/debit-status` | result of the next `/caas/direct/debit`: `S1000`, `E1326`, `E1308`, `E1318`, `E1337`, `auto-dup` |
+| `POST /_control/subscription-status` | result of the next `/subscription/send`: `S1000`, any `E*` code, or `transport` (HTTP 500) |
+| `POST /_control/push-callback` | push a §B notification (`REGISTERED`, `UNREGISTERED`, `PENDING`, `CHARGE`) to the service |
+| `POST /_control/reset` | clear logs, `seenExternalTrxIds`, both modes back to `S1000` |
+| `GET /_log/sms`, `GET /_log/debits`, `GET /_log/subscriptions` | what the service actually sent |
+
+```bash
+curl -sS -X POST localhost:8081/_control/debit-status -H 'Content-Type: application/json' -d '{"mode":"E1326"}'
+curl -sS -X POST localhost:8081/_control/subscription-status -H 'Content-Type: application/json' -d '{"mode":"transport"}'
+curl -sS -X POST localhost:8081/_control/reset -H 'Content-Type: application/json' -d '{}'
+```
+
 ## Scenarios
 
-Run these in order on a fresh `docker compose down -v && docker compose up -d`.
-`source .env` first so `$DB_USER`/`$DB_NAME` work in the `psql` lines.
+Run these in order on a fresh stack. `source .env` first so `$DB_USER`/`$DB_NAME`
+work in the `psql` lines. Re-running on a live stack needs
+`docker compose down -v && docker compose up -d --build` first — that wipes the
+database, the mock state file and all `_log` endpoints.
 
 ### a) Health
 
@@ -121,30 +152,36 @@ docker compose exec db psql -U "$DB_USER" -d "$DB_NAME" -c \
 ```
 `"suspended":1` · `tel:1000000003 | SUSPENDED | E1308 | failed_permanent` — never retried
 
-### j) `STOP` and no charge afterwards
+### j) `STOP` blocks a charge
 
 ```bash
+curl -sS -o /dev/null -X POST localhost:8080/subscribers/opt-in -H 'Content-Type: application/json' \
+  -d '{"subscriberId":"tel:1000000004"}'
+curl -sS -X POST localhost:8080/webhooks/mo-sms -H 'Content-Type: application/json' \
+  -d '{"sourceAddress":"tel:1000000004","message":"STOP","encoding":"0","version":"1.0"}'; echo
 curl -sS -X POST localhost:8080/webhooks/mo-sms -H 'Content-Type: application/json' \
   -d '{"sourceAddress":"tel:1000000001","message":"STOP","encoding":"0","version":"1.0"}'; echo
-curl -sS localhost:8081/_log/sms | python3 -c 'import json,sys; print(len([x for x in json.load(sys.stdin) if "unsubscribed" in x["message"]]))'
 curl -fsS -X POST localhost:8081/_control/debit-status -H 'Content-Type: application/json' -d '{"mode":"S1000"}'; echo
 curl -sS -X POST localhost:8080/jobs/daily-charge -H 'Content-Type: application/json' -d '{}'; echo
-curl -fsS localhost:8081/_log/debits | python3 -c 'import json,sys; print(len([x for x in json.load(sys.stdin) if x["subscriberId"]=="tel:1000000001"]))'
+curl -sS localhost:8081/_log/sms | python3 -c 'import json,sys; print("goodbyes:",len([x for x in json.load(sys.stdin) if "unsubscribed" in x["message"]]))'
+curl -fsS localhost:8081/_log/debits | python3 -c 'import json,sys; print("debits for 04:",len([x for x in json.load(sys.stdin) if x["subscriberId"]=="tel:1000000004"]))'
+docker compose exec db psql -U "$DB_USER" -d "$DB_NAME" -c \
+  "SELECT count(*) FROM charge_attempts WHERE subscriber_id='tel:1000000004';"
 ```
-`{"statusCode":"S1000","statusDetail":"Success"}` · one goodbye SMS · no new debit for that number
+Two `{"statusCode":"S1000","statusDetail":"Success"}` · two goodbye SMS · zero debits and zero `charge_attempts` rows for `tel:1000000004`. `tel:1000000001` is stopped here too — that is why scenario l shows it INACTIVE.
 
 ### k) Duplicate subscription callback
 
 ```bash
 for i in 1 2; do
-  curl -sS -X POST localhost:8081/_control/push-callback -H 'Content-Type: application/json' \
-    -d '{"subscriberId":"tel:1000000009","status":"REGISTERED"}'; echo
+  curl -sS -X POST localhost:8080/webhooks/subscription -H 'Content-Type: application/json' \
+    -d '{"applicationId":"APP_000123","subscriberId":"tel:1000000009","frequency":"daily","status":"REGISTERED","version":"1.0","timeStamp":"2026-11-21T10:00:00Z"}'; echo
 done
 docker compose exec db psql -U "$DB_USER" -d "$DB_NAME" -c 'SELECT count(*) FROM processed_webhook_events;'
 ```
-`{"delivered":true,"upstreamStatus":200,...}` twice · `processed_webhook_events` count = 1
+`{"statusCode":"S1000","statusDetail":"Success"}` twice · `processed_webhook_events` count = 1. The dedupe key includes `timeStamp`, so the two requests must carry the **same** `timeStamp`. `POST /_control/push-callback` stamps a fresh `timeStamp` on every call and therefore produces two distinct events — it is a delivery demo, not a dedupe test.
 
-### l) Status of all three subscribers
+### l) Status of the three subscribers
 
 ```bash
 for id in tel:1000000001 tel:1000000002 tel:1000000003; do
@@ -153,16 +190,32 @@ done
 ```
 INACTIVE with last charge · ACTIVE with last charge · SUSPENDED with `E1308` attempt
 
+### m) Platform refuses the opt-in
+
+```bash
+curl -fsS -X POST localhost:8081/_control/subscription-status -H 'Content-Type: application/json' -d '{"mode":"E1308"}'; echo
+curl -sS -o /dev/null -w "opt-in HTTP %{http_code}\n" -X POST localhost:8080/subscribers/opt-in \
+  -H 'Content-Type: application/json' -d '{"subscriberId":"tel:1000000010"}'
+docker compose exec db psql -U "$DB_USER" -d "$DB_NAME" -c \
+  "SELECT count(*) FROM subscribers WHERE id='tel:1000000010';"
+curl -sS -X POST localhost:8081/_control/reset -H 'Content-Type: application/json' -d '{}'; echo
+```
+`opt-in HTTP 502` · `count = 0` — nothing is left half-registered when the Platform refuses.
+
 ## Tests
 
 ```bash
 docker compose exec service ./vendor/bin/phpunit
 ```
 
-Tests run inside the `service` container and hit the already-running server at
-`http://service:8080` (Compose DNS) rather than starting a second PHP process;
-mock control/log calls use `http://platform-mock:8080`. Coverage includes
-charge-once, retry classification, opt-out race, and parallel-delivery idempotency.
+45 tests, 244 assertions, nothing skipped. Tests run inside the `service`
+container against the already-running stack (no second PHP process); mock
+control/log calls use `http://platform-mock:8080`. Test classes clean their data
+in `setUp()` — `MoneyIdempotencyTest` truncates all tables and every class calls
+`/_control/reset` — so the suite is order-independent and can be run twice in a
+row. Coverage: charge-once (repeat run and restart), retry classification with
+the same `externalTrxId`, `E1308` suspend, opt-out vs charge race, parallel job
+runs, duplicate callbacks, and platform failure mapping (E-code and transport → 502).
 
 ## Design notes
 
@@ -190,7 +243,15 @@ call so no long network wait serialises subscribers. Crash safety comes from
 the durable `pending` attempt: the next run replays the stored `externalTrxId`
 and treats `E1337` as success.
 
+**Platform failures at opt-in.** A non-`S1000` subscription response or a
+transport error both map to `502 Bad Gateway`, and the subscriber row is not
+created — nothing is left half-registered.
+
 ## Out of scope
 
 Real auth/SSO, multi-currency, USSD, DLR handling, Query Balance, production/HA
-infra, a real scheduler or queue, and pixel-perfect UI.
+infra, a real scheduler or queue, pixel-perfect UI, and a real operator sandbox.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Ekaterina Gorshkova.

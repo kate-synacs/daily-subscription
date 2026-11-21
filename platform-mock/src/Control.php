@@ -12,6 +12,8 @@ final class Control
     private const MODES = ['S1000', 'E1326', 'E1308', 'E1318', 'E1337', 'auto-dup'];
     private const STATUSES = ['REGISTERED', 'UNREGISTERED', 'PENDING', 'CHARGE'];
 
+    private const SUBSCRIPTION_MODES = ['S1000', 'E1326', 'E1308', 'E1318', 'E1337', 'transport'];
+
     public function __construct(private readonly MockState $state)
     {
     }
@@ -87,5 +89,20 @@ final class Control
         $this->state->reset();
 
         return [200, ['ok' => true]];
+    }
+
+    /** @return array{0:int,1:array<string,mixed>} */
+    public function subscriptionStatus(array $body): array
+    {
+        $mode = $body['mode'] ?? null;
+        if (!is_string($mode) || !in_array($mode, self::SUBSCRIPTION_MODES, true)) {
+            return [400, ['error' => 'invalid mode']];
+        }
+
+        $state = $this->state->load();
+        $state['subscriptionMode'] = $mode;
+        $this->state->save($state);
+
+        return [200, ['ok' => true, 'mode' => $mode]];
     }
 }

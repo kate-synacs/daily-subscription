@@ -4,37 +4,13 @@ declare(strict_types=1);
 
 namespace App\Tests\Money;
 
-use App\Repository\PdoFactory;
-use GuzzleHttp\Client;
+use App\Tests\Http\HttpTestCase;
 use GuzzleHttp\Promise\Utils;
-use PDO;
-use PHPUnit\Framework\TestCase;
 
 /** Parallel-delivery idempotency: correctness must come from Postgres only. */
-final class MoneyIdempotencyTest extends TestCase
+final class MoneyIdempotencyTest extends HttpTestCase
 {
-    private Client $service;
-    private Client $mock;
-    private PDO $pdo;
 
-    protected function setUp(): void
-    {
-        $this->service = new Client([
-            'base_uri' => 'http://service:8080',
-            'timeout' => 15,
-            'http_errors' => false,
-        ]);
-        $this->mock = new Client([
-            'base_uri' => 'http://platform-mock:8080',
-            'timeout' => 15,
-            'http_errors' => false,
-        ]);
-        $this->pdo = PdoFactory::fromEnv();
-        $this->pdo->exec(
-            'TRUNCATE charge_attempts, sms_log, processed_webhook_events, subscribers RESTART IDENTITY CASCADE'
-        );
-        $this->mock->post('/_control/reset');
-    }
 
     public function test_parallel_daily_charge_charges_once(): void
     {
@@ -42,8 +18,8 @@ final class MoneyIdempotencyTest extends TestCase
         $this->optIn('tel:1000000031');
 
         $responses = Utils::all([
-            $this->service->postAsync('/jobs/daily-charge', ['json' => []]),
-            $this->service->postAsync('/jobs/daily-charge', ['json' => []]),
+            $this->client->postAsync('/jobs/daily-charge', ['json' => []]),
+            $this->client->postAsync('/jobs/daily-charge', ['json' => []]),
         ])->wait();
         foreach ($responses as $response) {
             self::assertSame(200, $response->getStatusCode());
@@ -74,8 +50,8 @@ final class MoneyIdempotencyTest extends TestCase
             ],
         ];
         $responses = Utils::all([
-            $this->service->postAsync('/webhooks/mo-sms', $payload),
-            $this->service->postAsync('/webhooks/mo-sms', $payload),
+            $this->client->postAsync('/webhooks/mo-sms', $payload),
+            $this->client->postAsync('/webhooks/mo-sms', $payload),
         ])->wait();
         foreach ($responses as $response) {
             self::assertSame(200, $response->getStatusCode());
@@ -115,8 +91,8 @@ final class MoneyIdempotencyTest extends TestCase
         );
 
         Utils::all([
-            $this->service->postAsync('/jobs/daily-charge', ['json' => []]),
-            $this->service->postAsync('/jobs/daily-charge', ['json' => []]),
+            $this->client->postAsync('/jobs/daily-charge', ['json' => []]),
+            $this->client->postAsync('/jobs/daily-charge', ['json' => []]),
         ])->wait();
 
         $debits = array_values(array_filter(
@@ -157,27 +133,19 @@ final class MoneyIdempotencyTest extends TestCase
 
     private function mode(string $mode): void
     {
-        $this->mock->post('/_control/debit-status', ['json' => ['mode' => $mode]]);
+        $this->mockPost('/_control/debit-status', ['mode' => $mode]);
     }
 
     private function optIn(string $subscriberId): void
     {
-        $response = $this->service->post('/subscribers/opt-in', ['json' => ['subscriberId' => $subscriberId]]);
+        $response = $this->client->post('/subscribers/opt-in', ['json' => ['subscriberId' => $subscriberId]]);
         self::assertSame(200, $response->getStatusCode());
     }
 
     private function runJob(): void
     {
-        $response = $this->service->post('/jobs/daily-charge', ['json' => []]);
+        $response = $this->client->post('/jobs/daily-charge', ['json' => []]);
         self::assertSame(200, $response->getStatusCode());
-    }
-
-    /** @return array<int|string, mixed> */
-    private function mockLog(string $path): array
-    {
-        $decoded = $this->json((string) $this->mock->get($path)->getBody());
-
-        return is_array($decoded) ? $decoded : [];
     }
 
     /** @return array<int|string, mixed> */

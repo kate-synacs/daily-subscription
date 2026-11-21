@@ -1,6 +1,7 @@
 {
   "name": "daily-pass/service",
   "type": "project",
+  "license": "MIT",
   "require": {
     "php": ">=8.3",
     "nikic/fast-route": "^1.3",
