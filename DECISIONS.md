@@ -56,3 +56,65 @@ TBD — be honest.
 - `event_key = sha256(applicationId|subscriberId|status|timeStamp|version)`; `timeStamp` is included so two genuinely distinct notifications for the same subscriber/status (e.g. re-registration days apart) are not collapsed, while byte-identical redeliveries hit the `processed_webhook_events` PK and are skipped by `ON CONFLICT DO NOTHING`.
 - The webhook always replies HTTP 200 `S1000`, including on malformed input or internal errors (logged, swallowed): a 5xx makes the Platform retry indefinitely, whereas `S1000` is the contract's acknowledgement even for a no-op.
 - The webhook path never calls `/caas/direct/debit`: it only deduplicates and adjusts subscription state. Charging is exclusively the daily job's responsibility, so a duplicate delivery can never cause a charge.
+
+## Retry classification and backoff
+
+S1000 is the only "money moved" code. E1337 means the platform already took the
+money for this externalTrxId, so it is treated as charged and never retried —
+retrying it would either double-charge or spin forever.
+
+E1326 / E1318 are transient: the attempt row is set to failed_transient with
+next_retry_at = now + [2m, 10m, 30m] depending on attempt_count. The subscriber
+stays ACTIVE. After the third transient failure the attempt becomes
+failed_permanent and next_retry_at is cleared: we stop retrying that day but the
+subscriber is still charged the next billing day (new billing_day, new
+externalTrxId). No auto-recovery from failed_permanent without ops.
+
+E1308 is permanent: attempt -> failed_permanent, subscriber -> SUSPENDED. The
+job skips non-ACTIVE subscribers, so it is never charged again.
+
+Retries reuse the same external_trx_id stored in charge_attempts. A retry is the
+same logical transaction, not a new one — this is what makes a crash between
+"platform charged" and "we recorded it" safe: the next attempt hits the platform
+with the same id and gets E1337 (already charged), which we treat as success.
+
+Backoff is bounded at 3 attempts because the assignment is a daily product: the
+next billing day supersedes the retry anyway, and unbounded retries would turn a
+transient platform error into a retry storm.
+
+Known gaps: retries are processed only when /jobs/daily-charge runs (no real
+queue or scheduler); E1308 has no automatic reactivation; backoff has no jitter,
+which is fine for a single job instance but not for many.
+
+## Iteration 7c (parallel idempotency)
+- Charge claim order unchanged and verified: BEGIN → `SELECT ... FOR UPDATE` on the subscriber → ACTIVE re-check → `INSERT ... ON CONFLICT DO NOTHING RETURNING id` in the same transaction → COMMIT → Platform call. A conflict rolls back and skips without any debit call.
+- Due retries are claimed with `FOR UPDATE SKIP LOCKED LIMIT 20` inside one transaction; the attempt slot (`attempt_count+1`, `next_retry_at`) is consumed at claim time and committed before the Platform replay. Parallel job runs cannot claim the same row; a crash after claim loses one attempt slot, never money.
+- STOP idempotency: `$wasActive` is computed under the subscriber row lock and the lock is held until `status='INACTIVE'` is committed, so only the first STOP sends `action:"0"` and a goodbye SMS; later/parallel STOPs return `already_inactive`. This per-subscriber lock is deliberate and does not affect other subscribers or the charge path's no-lock-across-debit rule.
+- Receipt SMS is sent only when this transaction performs the `charged` transition (`S1000`). `E1337` never sends a receipt, including on retry/recovery, because the original charge already sent it.
+- Correctness comes only from Postgres row locks and unique indexes — no in-memory locks, static caches, running flags or advisory locks — so it survives restarts and multiple containers.
+
+## Idempotency under duplicates and parallel runs
+
+Two parallel /jobs/daily-charge runs cannot charge twice. The subscriber row is
+locked with SELECT ... FOR UPDATE; the charge_attempts row is inserted inside
+that same transaction and committed before the platform call. The second run
+blocks on the lock, then hits the unique (subscriber_id, billing_day) index
+(SQLSTATE 23505) and skips without calling the platform at all.
+
+Retries use a lease instead of a plain select: one transaction claims the due
+attempt row with FOR UPDATE SKIP LOCKED and immediately pushes next_retry_at
+forward, then commits. The platform call happens after the commit with the same
+external_trx_id; a parallel run cannot claim the row again because next_retry_at
+no longer matches. A crash between commit and the platform call costs one retry
+slot, not money - the next run re-sends the same external_trx_id and gets E1337.
+
+STOP is idempotent: the ACTIVE -> INACTIVE transition happens inside the
+FOR UPDATE block, and the goodbye SMS is sent only when that transition actually
+happened. A second STOP, sequential or parallel, returns already_inactive and
+does not call sendSubscription("0") or send another SMS.
+
+There are no in-memory locks, caches or is_running flags: all correctness comes
+from Postgres row locks and unique indexes, so it survives a container restart
+and multiple app instances. Known limitation: the lease gives at-most-once
+processing per attempt, not exactly-once delivery to the platform; duplicate
+delivery is safe only because direct debit is idempotent by externalTrxId.

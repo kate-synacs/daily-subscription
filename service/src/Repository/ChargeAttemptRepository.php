@@ -76,6 +76,31 @@ final class ChargeAttemptRepository
         $stmt->execute([$platformStatusCode, $id]);
     }
 
+    /**
+     * A leased retry already consumed its attempt slot and next_retry_at at
+     * claim time; on another transient outcome we only restore the status.
+     */
+    public function markTransientLeased(
+        int $id,
+        string $platformStatusCode,
+        string $platformStatusDetail,
+        ?DateTimeImmutable $nextRetryAt = null,
+    ): void {
+        $stmt = $this->pdo->prepare(
+            "UPDATE charge_attempts
+                SET status = 'failed_transient', platform_status_code = ?,
+                    platform_status_detail = ?, next_retry_at = COALESCE(?, next_retry_at),
+                    updated_at = now()
+              WHERE id = ? AND status = 'pending'"
+        );
+        $stmt->execute([
+            $platformStatusCode,
+            $platformStatusDetail,
+            $nextRetryAt?->format('Y-m-d\TH:i:sP'),
+            $id,
+        ]);
+    }
+
     public function markFailedPermanent(
         int $id,
         string $platformStatusCode,

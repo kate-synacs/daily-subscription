@@ -19,38 +19,40 @@ final class OptOutService
     ) {
     }
 
-    /** @return array<string, string> */
+    /**
+     * STOP is idempotent even under parallel delivery. The subscriber row is
+     * locked until status='INACTIVE' is committed, so only the first STOP
+     * ($wasActive === true) calls the Platform and sends the goodbye SMS.
+     *
+     * @return array<string, string>
+     */
     public function optOut(string $subscriberId): array
     {
         if (!Msisdn::validate($subscriberId)) {
             throw new BadRequestException('Invalid subscriberId');
         }
 
-        // Read under the row lock; the Platform call is outside the transaction.
         $this->pdo->beginTransaction();
         try {
-            $stmt = $this->pdo->prepare('SELECT id, status FROM subscribers WHERE id = ? FOR UPDATE');
+            $stmt = $this->pdo->prepare('SELECT status FROM subscribers WHERE id = ? FOR UPDATE');
             $stmt->execute([$subscriberId]);
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
-            $this->pdo->commit();
 
-            if ($row !== false && ($row['status'] ?? null) === 'INACTIVE') {
+            if ($row === false || ($row['status'] ?? null) === 'INACTIVE') {
+                $this->pdo->commit();
+
                 return ['status' => 'already_inactive'];
             }
-        } catch (\Throwable $e) {
-            if ($this->pdo->inTransaction()) {
-                $this->pdo->rollBack();
+
+            $wasActive = ($row['status'] ?? null) === 'ACTIVE';
+
+            // Platform failure must roll the claim back: never leave INACTIVE
+            // if opt-out was not accepted by the Platform.
+            if ($wasActive) {
+                $this->platform->sendSubscription($subscriberId, '0');
             }
-            throw $e;
-        }
 
-        // Platform failure must not leave the subscriber INACTIVE.
-        $this->platform->sendSubscription($subscriberId, '0');
-
-        $this->pdo->beginTransaction();
-        try {
             $this->subscribers->setStatus($subscriberId, 'INACTIVE');
-            // STOP also cancels any scheduled retries for this subscriber.
             $stmt = $this->pdo->prepare(
                 "UPDATE charge_attempts
                     SET next_retry_at = NULL, updated_at = now()
@@ -65,15 +67,17 @@ final class OptOutService
             throw $e;
         }
 
-        $message = 'You have been unsubscribed from Daily Pass. Reply START to resubscribe.';
-        $sms = $this->platform->sendSms($subscriberId, $message);
-        $this->subscribers->insertSmsLog(
-            $subscriberId,
-            'MT',
-            $message,
-            isset($sms['statusCode']) && is_string($sms['statusCode']) ? $sms['statusCode'] : null,
-        );
+        if ($wasActive) {
+            $message = 'You have been unsubscribed from Daily Pass. Reply START to resubscribe.';
+            $sms = $this->platform->sendSms($subscriberId, $message);
+            $this->subscribers->insertSmsLog(
+                $subscriberId,
+                'MT',
+                $message,
+                isset($sms['statusCode']) && is_string($sms['statusCode']) ? $sms['statusCode'] : null,
+            );
+        }
 
-        return ['status' => 'inactive'];
+        return ['status' => $wasActive ? 'inactive' : 'already_inactive'];
     }
 }

@@ -30,7 +30,7 @@ final class RetryExecutionTest extends ChargeTestCase
         $recovered = $this->attemptFor(self::SUBSCRIBER);
         self::assertIsArray($recovered);
         self::assertSame('charged', $recovered['status']);
-        self::assertSame(1, (int) $recovered['attempt_count'], 'A successful retry does not add a failure');
+        self::assertSame(2, (int) $recovered['attempt_count'], 'The retry slot is consumed at claim time');
 
         $debits = $this->debitLog();
         self::assertCount(2, $debits);

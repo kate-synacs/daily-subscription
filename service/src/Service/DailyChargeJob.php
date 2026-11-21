@@ -58,19 +58,65 @@ final class DailyChargeJob
             );
         }
 
-        // 2) Due retries: same attempt row and external_trx_id, never a new id.
-        $stmt = $this->pdo->prepare(
-            "SELECT subscriber_id, billing_day FROM charge_attempts
-              WHERE status = 'failed_transient' AND next_retry_at <= ?
-              ORDER BY id"
-        );
-        $stmt->execute([$now]);
-        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-            $subscriberId = (string) $row['subscriber_id'];
-            $attemptDay = (string) $row['billing_day'];
+        // 2) Due retries: lease at most 20 rows with FOR UPDATE SKIP LOCKED.
+        //    Two parallel job runs can never claim the same attempt; a crash
+        //    after COMMIT costs one attempt slot, never money.
+        $claims = [];
+        $backoffs = [1 => '+15 minutes', 2 => '+1 hour', 3 => null];
+        $this->pdo->beginTransaction();
+        try {
+            $stmt = $this->pdo->prepare(
+                "SELECT id, subscriber_id, billing_day, external_trx_id, attempt_count
+                   FROM charge_attempts
+                  WHERE status = 'failed_transient'
+                    AND next_retry_at <= ?
+                    AND attempt_count < 3
+                  ORDER BY next_retry_at
+                  FOR UPDATE SKIP LOCKED
+                  LIMIT 20"
+            );
+            $stmt->execute([$now]);
+
+            foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                $newCount = (int) $row['attempt_count'] + 1;
+                $backoff = $backoffs[$newCount] ?? null;
+                $nextRetryAt = $backoff === null
+                    ? null
+                    : $clock->now()->modify($backoff)->format('Y-m-d\TH:i:sP');
+
+                $update = $this->pdo->prepare(
+                    "UPDATE charge_attempts
+                        SET attempt_count = ?, next_retry_at = ?, updated_at = now()
+                      WHERE id = ? AND status = 'failed_transient'"
+                );
+                $update->execute([$newCount, $nextRetryAt, $row['id']]);
+
+                $claims[] = [
+                    'subscriberId' => (string) $row['subscriber_id'],
+                    'billingDay' => (string) $row['billing_day'],
+                    'attemptId' => (int) $row['id'],
+                    'externalTrxId' => (string) $row['external_trx_id'],
+                ];
+            }
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
+
+        // The Platform is only called after the lease is COMMITted.
+        foreach ($claims as $claim) {
             $this->runOne(
-                fn (): array => $this->charges->executeRetry($subscriberId, $attemptDay, $clock),
-                $subscriberId,
+                fn (): array => $this->charges->executeClaimedRetry(
+                    $claim['subscriberId'],
+                    $claim['billingDay'],
+                    $claim['attemptId'],
+                    $claim['externalTrxId'],
+                    $clock,
+                ),
+                $claim['subscriberId'],
                 $summary,
             );
         }

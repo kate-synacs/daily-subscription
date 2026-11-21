@@ -41,14 +41,13 @@ final class ChargeService
 
         $this->pdo->beginTransaction();
         try {
-            // Opt-out race guard: if the subscriber opted out while we were
-            // waiting for the lock, the re-check below sees INACTIVE and skips.
             $stmt = $this->pdo->prepare(
                 'SELECT id, status FROM subscribers WHERE id = ? FOR UPDATE'
             );
             $stmt->execute([$subscriberId]);
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
+            // Opt-out race guard: if the subscriber opted out while we were waiting for the lock, skip.
             if ($row === false || ($row['status'] ?? null) !== 'ACTIVE') {
                 $this->pdo->rollBack();
 
@@ -59,6 +58,9 @@ final class ChargeService
                 ];
             }
 
+            // Atomic claim inside the SAME transaction as the FOR UPDATE lock.
+            // ON CONFLICT DO NOTHING turns a 23505 into NULL: another run owns
+            // today's attempt, so we roll back and never call the Platform.
             $attemptId = $this->attempts->insertPending(
                 $subscriberId,
                 $billingDay,
@@ -68,31 +70,22 @@ final class ChargeService
             );
 
             if ($attemptId === null) {
-                // Conflict on (subscriber_id, billing_day): never mint a new id.
                 $this->pdo->rollBack();
-            } else {
-                // Attempt is durable BEFORE the Platform call; no lock is held.
-                $this->pdo->commit();
-            }
-        } catch (\Throwable $e) {
-            if ($this->pdo->inTransaction()) {
-                $this->pdo->rollBack();
-            }
-            throw $e;
-        }
 
-        if ($attemptId === null) {
-            $existing = $this->attempts->findPendingAttempt($subscriberId, $billingDay);
-            if ($existing === null || ($existing['status'] ?? null) !== 'pending') {
                 return [
                     'subscriberId' => $subscriberId,
                     'outcome' => 'skipped',
                     'reason' => 'already_attempted_today',
                 ];
             }
-            // Crash recovery: reuse the exact external_trx_id stored earlier.
-            $externalTrxId = (string) $existing['external_trx_id'];
-            $attemptId = (int) $existing['id'];
+
+            // Attempt is durable BEFORE the Platform call; no lock is held.
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
         }
 
         try {
@@ -489,5 +482,173 @@ final class ChargeService
         $result['recovery'] = $recovery;
 
         return $result;
+    }
+
+    /**
+     * Execute a retry that DailyChargeJob already leased with FOR UPDATE
+     * SKIP LOCKED. The attempt slot and next_retry_at were consumed at claim
+     * time; this method only replays the SAME external_trx_id and records the
+     * outcome. No new id and no second receipt on E1337.
+     *
+     * @return array<string, mixed>
+     */
+    public function executeClaimedRetry(
+        string $subscriberId,
+        string $billingDay,
+        int $attemptId,
+        string $externalTrxId,
+        Clock $clock,
+    ): array {
+        $this->pdo->beginTransaction();
+        try {
+            $stmt = $this->pdo->prepare('SELECT status FROM subscribers WHERE id = ? FOR UPDATE');
+            $stmt->execute([$subscriberId]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            $this->pdo->commit();
+            if ($row === false || ($row['status'] ?? null) !== 'ACTIVE') {
+                return ['subscriberId' => $subscriberId, 'outcome' => 'skipped', 'reason' => 'not_active'];
+            }
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
+
+        // Re-arm under the claim's identity so guarded UPDATEs still apply.
+        $this->pdo->beginTransaction();
+        try {
+            $stmt = $this->pdo->prepare(
+                "UPDATE charge_attempts
+                    SET status = 'pending', updated_at = now()
+                  WHERE id = ? AND status = 'failed_transient'
+                    AND external_trx_id = ? AND billing_day = ?"
+            );
+            $stmt->execute([$attemptId, $externalTrxId, $billingDay]);
+            if ($stmt->rowCount() === 0) {
+                $this->pdo->rollBack();
+
+                return ['subscriberId' => $subscriberId, 'outcome' => 'race_lost', 'attemptId' => $attemptId];
+            }
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
+
+        $stmt = $this->pdo->prepare('SELECT amount, currency FROM charge_attempts WHERE id = ?');
+        $stmt->execute([$attemptId]);
+        $attempt = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($attempt === false) {
+            return ['subscriberId' => $subscriberId, 'outcome' => 'skipped', 'reason' => 'attempt_missing'];
+        }
+        $amount = (string) $attempt['amount'];
+        $currency = (string) $attempt['currency'];
+
+        try {
+            $response = $this->platform->directDebit($externalTrxId, $subscriberId, $amount, $currency);
+        } catch (\Throwable) {
+            $this->log->warning('leased retry transport error, attempt left pending', [
+                'attemptId' => $attemptId,
+                'externalTrxId' => $externalTrxId,
+            ]);
+
+            return [
+                'subscriberId' => $subscriberId,
+                'outcome' => 'error',
+                'reason' => 'transport',
+                'attemptId' => $attemptId,
+            ];
+        }
+
+        $code = isset($response['statusCode']) && is_string($response['statusCode'])
+            ? $response['statusCode']
+            : 'UNKNOWN';
+        $detail = isset($response['statusDetail']) && is_string($response['statusDetail'])
+            ? $response['statusDetail']
+            : '';
+
+        switch ($code) {
+            case 'S1000':
+                return $this->finalizeCharged($subscriberId, $attemptId, $response, $detail, $amount, $currency);
+
+            case 'E1337':
+                // Already charged; never resend a receipt for this logical charge.
+                $this->pdo->beginTransaction();
+                try {
+                    $this->attempts->markAlreadyCharged($attemptId, $code);
+                    $this->pdo->commit();
+                } catch (\Throwable $e) {
+                    if ($this->pdo->inTransaction()) {
+                        $this->pdo->rollBack();
+                    }
+                    throw $e;
+                }
+
+                return ['subscriberId' => $subscriberId, 'outcome' => 'already_charged', 'attemptId' => $attemptId];
+
+            case 'E1308':
+                $this->pdo->beginTransaction();
+                try {
+                    $this->attempts->markFailedPermanent($attemptId, $code, $detail);
+                    $stmt = $this->pdo->prepare(
+                        "UPDATE subscribers
+                            SET status = 'SUSPENDED', last_charge_error = 'E1308', updated_at = now()
+                          WHERE id = ?"
+                    );
+                    $stmt->execute([$subscriberId]);
+                    $this->pdo->commit();
+                } catch (\Throwable $e) {
+                    if ($this->pdo->inTransaction()) {
+                        $this->pdo->rollBack();
+                    }
+                    throw $e;
+                }
+
+                return ['subscriberId' => $subscriberId, 'outcome' => 'suspended', 'attemptId' => $attemptId];
+
+            case 'E1326':
+            case 'E1318':
+                $this->markTransientAfterLease($attemptId, $code, $detail, null);
+
+                return [
+                    'subscriberId' => $subscriberId,
+                    'outcome' => 'transient',
+                    'attemptId' => $attemptId,
+                ];
+
+            default:
+                $this->log->warning('unknown leased retry status code, treating as transient', [
+                    'attemptId' => $attemptId,
+                    'statusCode' => $code,
+                ]);
+                $this->markTransientAfterLease($attemptId, $code, $detail, $clock->now()->modify('+1 hour'));
+
+                return [
+                    'subscriberId' => $subscriberId,
+                    'outcome' => 'transient',
+                    'attemptId' => $attemptId,
+                ];
+        }
+    }
+
+    private function markTransientAfterLease(
+        int $attemptId,
+        string $code,
+        string $detail,
+        ?\DateTimeImmutable $nextRetryAt,
+    ): void {
+        $this->pdo->beginTransaction();
+        try {
+            $this->attempts->markTransientLeased($attemptId, $code, $detail, $nextRetryAt);
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
     }
 }
