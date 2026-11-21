@@ -44,6 +44,18 @@ final class SubscriberRepository
         $stmt->execute([$id]);
     }
 
+    /** Webhook REGISTERED path: upsert handles events arriving before or after opt-in. */
+    public function upsertRegistered(string $id): void
+    {
+        $stmt = $this->pdo->prepare(
+            "INSERT INTO subscribers (id, status, platform_registered_at)
+             VALUES (?, 'ACTIVE', now())
+             ON CONFLICT (id) DO UPDATE
+               SET status = 'ACTIVE', platform_registered_at = now(), updated_at = now()"
+        );
+        $stmt->execute([$id]);
+    }
+
     public function setStatus(string $id, string $status): void
     {
         // updated_at has no DB trigger; always set it explicitly.

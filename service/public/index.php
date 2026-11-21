@@ -12,13 +12,16 @@ use App\Exception\NotFoundException;
 use App\Exception\PlatformException;
 use App\Http\Controller\OptInController;
 use App\Http\Controller\StatusController;
+use App\Http\Controller\SubscriptionWebhookController;
 use App\Http\Request;
 use App\Http\Response;
 use App\Platform\PlatformClient;
 use App\Repository\PdoFactory;
+use App\Repository\ProcessedWebhookEventRepository;
 use App\Repository\SubscriberRepository;
 use App\Service\OptInService;
 use App\Service\StatusService;
+use App\Service\WebhookService;
 use FastRoute\Dispatcher;
 use FastRoute\RouteCollector;
 use GuzzleHttp\Client as GuzzleClient;
@@ -34,11 +37,15 @@ $platform = new PlatformClient($config, new GuzzleClient(), $log);
 $subscribers = new SubscriberRepository($pdo);
 $optInController = new OptInController(new OptInService($pdo, $subscribers, $platform));
 $statusController = new StatusController(new StatusService($pdo));
+$webhookController = new SubscriptionWebhookController(
+    new WebhookService($log, new ProcessedWebhookEventRepository($pdo), $subscribers),
+    $log,
+);
 
 $defineRoutes = require __DIR__ . '/../src/Http/routes.php';
 
 $dispatcher = FastRoute\simpleDispatcher(
-    static function (RouteCollector $r) use ($defineRoutes, $optInController, $statusController): void {
+    static function (RouteCollector $r) use ($defineRoutes, $optInController, $statusController, $webhookController): void {
         $handlers = [
             'health' => static fn (Request $req): Response => Response::json(200, [
                 'ok' => true,
@@ -46,6 +53,7 @@ $dispatcher = FastRoute\simpleDispatcher(
             ]),
             'optIn' => static fn (Request $req): Response => $optInController->handle($req),
             'status' => static fn (Request $req): Response => $statusController->handle($req),
+            'webhook' => static fn (Request $req): Response => $webhookController->handle($req),
         ];
         $defineRoutes($r, $handlers);
     }

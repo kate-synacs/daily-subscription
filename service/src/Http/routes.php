@@ -11,4 +11,5 @@ return static function (RouteCollector $r, array $handlers): void {
     $r->addRoute('GET', '/health', $handlers['health']);
     $r->addRoute('POST', '/subscribers/opt-in', $handlers['optIn']);
     $r->addRoute('GET', '/subscribers/{subscriberId}', $handlers['status']);
+    $r->addRoute('POST', '/webhooks/subscription', $handlers['webhook']);
 };

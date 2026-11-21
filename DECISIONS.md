@@ -36,3 +36,8 @@ TBD — be honest.
 - Follow-up: `already_active` now requires `status='ACTIVE'` **and** `platform_registered_at IS NOT NULL`, tracked by migration `0002_opt_in_tracking.sql`. An ACTIVE row with a NULL timestamp is a half-done opt-in and is re-registered instead of being assumed complete.
 - Follow-up: the Platform call stays outside the `FOR UPDATE` transaction; the lock is used only to read state, then committed. The state-changing upsert runs in a second short transaction that sets `status='ACTIVE'` and `platform_registered_at=now()` together, so neither can be persisted without the Platform's `S1000`.
 - Follow-up: the mock now records every `/subscription/send` at `GET /_log/subscriptions`, which makes "called exactly once" externally provable for opt-in and for the half-done recovery path; `/_control/reset` clears it.
+
+## Iteration 5 (webhook)
+- `event_key = sha256(applicationId|subscriberId|status|timeStamp|version)`; `timeStamp` is included so two genuinely distinct notifications for the same subscriber/status (e.g. re-registration days apart) are not collapsed, while byte-identical redeliveries hit the `processed_webhook_events` PK and are skipped by `ON CONFLICT DO NOTHING`.
+- The webhook always replies HTTP 200 `S1000`, including on malformed input or internal errors (logged, swallowed): a 5xx makes the Platform retry indefinitely, whereas `S1000` is the contract's acknowledgement even for a no-op.
+- The webhook path never calls `/caas/direct/debit`: it only deduplicates and adjusts subscription state. Charging is exclusively the daily job's responsibility, so a duplicate delivery can never cause a charge.
