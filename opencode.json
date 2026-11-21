@@ -1,0 +1,73 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode-go/claude-haiku-5-5",
+  "small_model": "opencode/deepseek-v4.1-flash-free",
+  "agent": {
+    "build": {
+      "model": "opencode-go/claude-haiku-5-5",
+      "prompt": "{file:./AGENTS.md}",
+      "tools": {
+        "write": true,
+        "edit": true,
+        "bash": true,
+        "read": true,
+        "grep": true,
+        "glob": true,
+        "list": true,
+        "patch": true,
+        "webfetch": false
+      }
+    },
+    "plan": {
+      "model": "opencode-go/claude-haiku-5-5",
+      "prompt": "{file:./AGENTS.md}",
+      "tools": {
+        "write": false,
+        "edit": false,
+        "bash": false,
+        "read": true,
+        "grep": true,
+        "glob": true,
+        "list": true,
+        "webfetch": false
+      }
+    },
+    "money-path": {
+      "model": "opencode-go/deepseek-v4-pro",
+      "prompt": "{file:./AGENTS.md}",
+      "tools": {
+        "write": true,
+        "edit": true,
+        "bash": true,
+        "read": true,
+        "grep": true,
+        "glob": true,
+        "list": true,
+        "patch": true,
+        "webfetch": false
+      }
+    }
+  },
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "docker compose *": "allow",
+      "composer *": "allow",
+      "./vendor/bin/phpunit*": "allow",
+      "git status": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "ls*": "allow",
+      "cat*": "allow"
+    },
+    "edit": "ask",
+    "write": "ask",
+    "webfetch": "deny"
+  },
+  "instructions": [
+    "AGENTS.md",
+    ".opencode/skills/php-strict/SKILL.md",
+    ".opencode/skills/money-idempotency/SKILL.md",
+    "DECISIONS.md"
+  ]
+}
