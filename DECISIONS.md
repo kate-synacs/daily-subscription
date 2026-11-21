@@ -27,8 +27,16 @@
 - When opting out, pending retries have `next_retry_at` set to NULL (and `failed_transient` rows stay non-due), so a stopped subscriber can never be revived by the retry phase — which also re-checks ACTIVE under the row lock.
 - Opt-out itself is idempotent: an already-INACTIVE subscriber returns without a second Platform `action:"0"` or goodbye SMS; a Platform failure never marks the subscriber INACTIVE.
 
+## Crash safety
+- The `pending` charge_attempts row is committed before the Platform call, so a crash after the Platform accepted the debit leaves a durable row with a known `external_trx_id`. The next job run replays that exact id; `E1337` is treated as success and no receipt is resent. No new id is ever minted.
+- Retry leases are committed before the replay. A crash after claiming costs one attempt slot (`attempt_count` was already advanced), not money: the row is still `failed_transient` and the same `externalTrxId` is reused on the next due run.
+- Finalizing UPDATEs require `AND status='pending'`; zero affected rows means another process already finalized the attempt, so we treat it as `race_lost` and do not send a receipt.
+
 ## Skipped / known gaps
-TBD — be honest.
+- Deliberately skipped: real auth/SSO, multi-currency, USSD, DLR handling, Query Balance, production/HA infrastructure, a real scheduler or queue, and pixel-perfect UI.
+- Retries only run when `POST /jobs/daily-charge` is called; there is no background scheduler. Due attempts are capped at 20 per run and have no jitter, which is fine for one job instance but not a fleet.
+- `E1308` has no automatic reactivation path — an operator must opt the subscriber back in. The transient backoff consumes an attempt slot at claim time, so a crash after the claim loses a retry without losing money.
+- The mock is in-memory/file-backed per container; restarting `platform-mock` clears its logs and seen-id history. It is a demo fixture, not a durable billing gateway.
 
 ## Iteration 1 (skeleton)
 - **Opt-in request field (clarification):** use `subscriberId` (not `msisdn`) in `POST /subscribers/opt-in` request bodies for consistency with platform contract (`docs/ASSIGNMENT.md` §A) and persisted key. Boundary accepts `{"subscriberId":"tel:..."}` validated with `^tel:\d+$` and treated as an opaque alias (never parsed as a phone number); demo value may equal an MSISDN but code must not assume that.
