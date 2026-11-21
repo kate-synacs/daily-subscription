@@ -1,0 +1,73 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME:-dailypass}
+      POSTGRES_USER: ${DB_USER:-dailypass}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change_me}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-dailypass} -d ${DB_NAME:-dailypass}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  service:
+    build:
+      context: ./service
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_PORT: 8080
+      APP_ENV: ${APP_ENV:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-dailypass}
+      DB_USER: ${DB_USER:-dailypass}
+      DB_PASSWORD: ${DB_PASSWORD:-change_me}
+      PLATFORM_APP_ID: ${PLATFORM_APP_ID:-APP_000123}
+      PLATFORM_PASSWORD: ${PLATFORM_PASSWORD:-change_me}
+      PLATFORM_BASE_URL: ${PLATFORM_BASE_URL:-http://platform-mock:8080}
+      DAILY_FEE: ${DAILY_FEE:-5.00}
+      CURRENCY: ${CURRENCY:-XTS}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  platform-mock:
+    build:
+      context: ./platform-mock
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_PORT: 8080
+      APP_ENV: ${APP_ENV:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PLATFORM_BASE_URL: ${PLATFORM_BASE_URL:-http://platform-mock:8080}
+      SERVICE_BASE_URL: ${SERVICE_BASE_URL:-http://service:8080}
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  db_data:
