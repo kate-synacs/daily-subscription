@@ -1,13 +1,21 @@
 # Decisions
 
 ## externalTrxId
-TBD — fill after implementing the charge job.
+- `hash('sha256', $subscriberId . ':' . $billingDay)` with `$billingDay = YYYY-MM-DD` UTC (`ChargeCalculator::externalTrxId()`). Deterministic by construction: identical input always yields the same logical charge key, across re-runs, retries and process restarts; a different day yields a different key. Nothing random/time-based is used, so a retry can never accidentally create a second charge.
 
 ## Charge-once enforcement
-TBD — describe the UNIQUE index and the transaction boundary.
+- `UNIQUE (subscriber_id, billing_day)` is the real guarantee. `INSERT ... ON CONFLICT (subscriber_id, billing_day) DO NOTHING RETURNING id` gives a durable `pending` row or NULL; NULL means a row already exists today. The Platform is only called after that row is COMMITted, and the `FOR UPDATE` subscriber lock is released before the HTTP call. Every finalizing UPDATE has `AND status='pending'`; 0 rows affected is `race_lost` and no receipt SMS is sent.
+- A conflict on a still-`pending` row is crash recovery, not a duplicate charge: the stored `external_trx_id` is reused verbatim (the Platform answers `E1337`). A conflict on any terminal row is skipped without a Platform call.
+- Billing day is supplied by the injected `App\Clock\Clock`; the HTTP endpoint takes no date parameter. `SystemClock` is production, `FrozenClock` lives in `tests/Support` for deterministic tests.
 
 ## Retry policy
-TBD — bounded retries, backoff, same externalTrxId.
+- `S1000` terminal-ok → mark charged, store referenceId, send receipt; `E1337` terminal-ok → mark `already_charged`, no retry, no receipt (we cannot know the original referenceId); `E1308` terminal-fail → `status='SUSPENDED'`, no retry; `E1326` and `E1318` transient → `failed_transient` with attempt_count+1 and a scheduled `next_retry_at`, subscriber stays ACTIVE with `last_charge_error`.
+- Backoff is persistent in `charge_attempts`: current count 0 → +15 minutes, 1 → +1 hour, count >= 2 → no further schedule (max 3 attempts total). Retries reuse the SAME `externalTrxId`. Execution of due attempts is deliberately deferred to Iteration 7a — this iteration only records the schedule.
+
+## Iteration 6 (charge core)
+- Currency is read from the existing `CURRENCY` env var (not `DAILY_CURRENCY`), per clarification; the receipt message interpolates `amount()` and `currency()` from config, so it stays consistent with the configured daily fee.
+- The `+4 hours` backoff slot in the instruction is unreachable under the explicit `attemptCount >= 2` stop rule; I followed the explicit rule (3 attempts total: 15m, then 1h, then stop) and flagged this in the report.
+- The Platform call is a real second debit request on crash recovery (the mock's `auto-dup` answers `E1337`), so the debit log has two entries with the same `externalTrxId`; it is not a second charge and produces no second receipt.
 
 ## Opt-out vs charge race
 TBD — describe SELECT ... FOR UPDATE and the status re-check.

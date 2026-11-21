@@ -73,8 +73,9 @@ final class PlatformClient
     }
 
     /**
-     * §D — deliberately left unimplemented until the charge job exists.
-     * The signature is fixed now so callers can be typed later without churn.
+     * §D — Direct Debit. The raw response is returned (including non-S1000
+     * codes) so the charge service can classify it. Transport failures throw;
+     * the caller leaves the pending attempt untouched for crash recovery.
      *
      * @return array<string, mixed>
      */
@@ -85,7 +86,19 @@ final class PlatformClient
         string $currency,
         string $paymentInstrumentName = 'Mobile Account',
     ): array {
-        throw new \LogicException('directDebit not implemented until Iteration 6');
+        $response = $this->post('/caas/direct/debit', [
+            'applicationId' => $this->applicationId,
+            'password' => $this->password,
+            'externalTrxId' => $externalTrxId,
+            'subscriberId' => $subscriberId,
+            'paymentInstrumentName' => $paymentInstrumentName,
+            'amount' => $amount,
+            'currency' => $currency,
+        ]);
+
+        $this->log->info('platform caas/direct/debit', $this->safeContext($response, $subscriberId));
+
+        return $response;
     }
 
     /**

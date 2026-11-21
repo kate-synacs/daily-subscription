@@ -4,21 +4,27 @@ declare(strict_types=1);
 
 require __DIR__ . '/../vendor/autoload.php';
 
+use App\Clock\SystemClock;
 use App\Config\Config;
 use App\Exception\BadRequestException;
 use App\Exception\DomainException;
 use App\Exception\MethodNotAllowedException;
 use App\Exception\NotFoundException;
 use App\Exception\PlatformException;
+use App\Http\Controller\DailyChargeController;
 use App\Http\Controller\OptInController;
 use App\Http\Controller\StatusController;
 use App\Http\Controller\SubscriptionWebhookController;
 use App\Http\Request;
 use App\Http\Response;
 use App\Platform\PlatformClient;
+use App\Repository\ChargeAttemptRepository;
 use App\Repository\PdoFactory;
 use App\Repository\ProcessedWebhookEventRepository;
 use App\Repository\SubscriberRepository;
+use App\Service\ChargeCalculator;
+use App\Service\ChargeService;
+use App\Service\DailyChargeJob;
 use App\Service\OptInService;
 use App\Service\StatusService;
 use App\Service\WebhookService;
@@ -33,19 +39,25 @@ $config = new Config();
 $pdo = PdoFactory::fromEnv();
 $log = new Logger('daily-pass');
 $log->pushHandler(new StreamHandler('php://stderr', Logger::INFO));
+$clock = new SystemClock();
 $platform = new PlatformClient($config, new GuzzleClient(), $log);
 $subscribers = new SubscriberRepository($pdo);
+$attempts = new ChargeAttemptRepository($pdo);
+$calculator = new ChargeCalculator($config);
+$charges = new ChargeService($pdo, $attempts, $subscribers, $calculator, $platform, $log);
+
 $optInController = new OptInController(new OptInService($pdo, $subscribers, $platform));
-$statusController = new StatusController(new StatusService($pdo));
+$statusController = new StatusController(new StatusService($pdo, $clock));
 $webhookController = new SubscriptionWebhookController(
     new WebhookService($log, new ProcessedWebhookEventRepository($pdo), $subscribers),
     $log,
 );
+$dailyChargeController = new DailyChargeController(new DailyChargeJob($pdo, $charges, $log));
 
 $defineRoutes = require __DIR__ . '/../src/Http/routes.php';
 
 $dispatcher = FastRoute\simpleDispatcher(
-    static function (RouteCollector $r) use ($defineRoutes, $optInController, $statusController, $webhookController): void {
+    static function (RouteCollector $r) use ($defineRoutes, $optInController, $statusController, $webhookController, $dailyChargeController): void {
         $handlers = [
             'health' => static fn (Request $req): Response => Response::json(200, [
                 'ok' => true,
@@ -54,6 +66,7 @@ $dispatcher = FastRoute\simpleDispatcher(
             'optIn' => static fn (Request $req): Response => $optInController->handle($req),
             'status' => static fn (Request $req): Response => $statusController->handle($req),
             'webhook' => static fn (Request $req): Response => $webhookController->handle($req),
+            'dailyCharge' => static fn (Request $req): Response => $dailyChargeController->handle($req),
         ];
         $defineRoutes($r, $handlers);
     }

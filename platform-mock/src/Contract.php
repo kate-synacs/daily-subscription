@@ -100,7 +100,6 @@ final class Contract
                 $code = 'E1337';
                 $detail = 'Duplicate request';
             } else {
-                $state['seenExternalTrxIds'][] = $externalTrxId;
                 $code = 'S1000';
                 $detail = 'Request was successfully processed';
                 $referenceId = $this->randomDigits(8);
@@ -118,6 +117,12 @@ final class Contract
             if ($mode === 'S1000') {
                 $referenceId = $this->randomDigits(8);
             }
+        }
+
+        // Every successful debit is remembered, in any mode, so switching the
+        // mock to auto-dup later can reproduce E1337 for an earlier real charge.
+        if ($code === 'S1000') {
+            $state['seenExternalTrxIds'][] = $externalTrxId;
         }
 
         $entry = [

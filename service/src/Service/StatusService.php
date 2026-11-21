@@ -4,13 +4,16 @@ declare(strict_types=1);
 
 namespace App\Service;
 
+use App\Clock\Clock;
 use App\Exception\NotFoundException;
 use PDO;
 
 final class StatusService
 {
-    public function __construct(private readonly PDO $pdo)
-    {
+    public function __construct(
+        private readonly PDO $pdo,
+        private readonly Clock $clock,
+    ) {
     }
 
     /** @return array<string, mixed> */
@@ -28,10 +31,10 @@ final class StatusService
         $stmt = $this->pdo->prepare(
             'SELECT billing_day, status, external_trx_id, reference_id, platform_status_code,
                     attempt_count, next_retry_at, created_at, updated_at
-               FROM charge_attempts WHERE subscriber_id = ?
-              ORDER BY billing_day DESC, id DESC LIMIT 1'
+               FROM charge_attempts WHERE subscriber_id = ? AND billing_day = ?
+              ORDER BY id DESC LIMIT 1'
         );
-        $stmt->execute([$subscriberId]);
+        $stmt->execute([$subscriberId, $this->clock->today()]);
         $charge = $stmt->fetch(PDO::FETCH_ASSOC);
 
         $lastCharge = null;
