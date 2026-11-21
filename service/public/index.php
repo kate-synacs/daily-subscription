@@ -12,6 +12,7 @@ use App\Exception\MethodNotAllowedException;
 use App\Exception\NotFoundException;
 use App\Exception\PlatformException;
 use App\Http\Controller\DailyChargeController;
+use App\Http\Controller\MoSmsController;
 use App\Http\Controller\OptInController;
 use App\Http\Controller\StatusController;
 use App\Http\Controller\SubscriptionWebhookController;
@@ -26,6 +27,7 @@ use App\Service\ChargeCalculator;
 use App\Service\ChargeService;
 use App\Service\DailyChargeJob;
 use App\Service\OptInService;
+use App\Service\OptOutService;
 use App\Service\StatusService;
 use App\Service\WebhookService;
 use FastRoute\Dispatcher;
@@ -53,11 +55,12 @@ $webhookController = new SubscriptionWebhookController(
     $log,
 );
 $dailyChargeController = new DailyChargeController(new DailyChargeJob($pdo, $charges, $log));
+$moSmsController = new MoSmsController(new OptOutService($pdo, $subscribers, $platform), $log);
 
 $defineRoutes = require __DIR__ . '/../src/Http/routes.php';
 
 $dispatcher = FastRoute\simpleDispatcher(
-    static function (RouteCollector $r) use ($defineRoutes, $optInController, $statusController, $webhookController, $dailyChargeController): void {
+    static function (RouteCollector $r) use ($defineRoutes, $optInController, $statusController, $webhookController, $dailyChargeController, $moSmsController): void {
         $handlers = [
             'health' => static fn (Request $req): Response => Response::json(200, [
                 'ok' => true,
@@ -67,6 +70,7 @@ $dispatcher = FastRoute\simpleDispatcher(
             'status' => static fn (Request $req): Response => $statusController->handle($req),
             'webhook' => static fn (Request $req): Response => $webhookController->handle($req),
             'dailyCharge' => static fn (Request $req): Response => $dailyChargeController->handle($req),
+            'moSms' => static fn (Request $req): Response => $moSmsController->handle($req),
         ];
         $defineRoutes($r, $handlers);
     }

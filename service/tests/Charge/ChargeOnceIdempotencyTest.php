@@ -17,7 +17,7 @@ final class ChargeOnceIdempotencyTest extends ChargeTestCase
         self::assertSame(200, $status);
         [, $first] = $this->runChargeJob();
         self::assertSame(0, $first['charged'] ?? null);
-        self::assertSame(1, $first['skipped'] ?? null);
+        self::assertSame(0, $first['processed'] ?? null);
 
         $attempt = $this->attemptFor('tel:1000000011');
         self::assertIsArray($attempt);
@@ -58,7 +58,7 @@ final class ChargeOnceIdempotencyTest extends ChargeTestCase
         $this->setDebitMode('auto-dup');
 
         [, $summary] = $this->runChargeJob();
-        self::assertSame(1, $summary['alreadyCharged'] ?? null);
+        self::assertSame(1, $summary['recovered'] ?? null);
 
         $recovered = $this->attemptFor('tel:1000000011');
         self::assertIsArray($recovered);

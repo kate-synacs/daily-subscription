@@ -41,6 +41,8 @@ final class ChargeService
 
         $this->pdo->beginTransaction();
         try {
+            // Opt-out race guard: if the subscriber opted out while we were
+            // waiting for the lock, the re-check below sees INACTIVE and skips.
             $stmt = $this->pdo->prepare(
                 'SELECT id, status FROM subscribers WHERE id = ? FOR UPDATE'
             );
@@ -286,5 +288,206 @@ final class ChargeService
             'attemptId' => $attemptId,
             'nextRetryAt' => $nextRetryAt?->format('Y-m-d\TH:i:sP'),
         ];
+    }
+
+    /**
+     * Replay a due failed_transient attempt, reusing its stored external_trx_id.
+     * Classification is identical to chargeSubscriber (same private helpers).
+     *
+     * @return array<string, mixed>
+     */
+    public function executeRetry(string $subscriberId, string $billingDay, Clock $clock): array
+    {
+        $attempt = $this->findReplayAttempt($subscriberId, $billingDay, 'failed_transient', 3);
+        if ($attempt === null) {
+            return ['subscriberId' => $subscriberId, 'outcome' => 'skipped', 'reason' => 'no_due_retry'];
+        }
+
+        return $this->replayAttempt($subscriberId, $attempt, $clock, false);
+    }
+
+    /**
+     * Replay a pending attempt left by a crash, with the SAME external_trx_id.
+     * Platform idempotency (E1337) makes this safe.
+     *
+     * @return array<string, mixed>
+     */
+    public function executeRecovery(string $subscriberId, string $billingDay, Clock $clock): array
+    {
+        $attempt = $this->findReplayAttempt($subscriberId, $billingDay, 'pending');
+        if ($attempt === null) {
+            return ['subscriberId' => $subscriberId, 'outcome' => 'skipped', 'reason' => 'no_pending_attempt'];
+        }
+
+        return $this->replayAttempt($subscriberId, $attempt, $clock, true);
+    }
+
+    /** @return array<string, mixed>|null */
+    private function findReplayAttempt(
+        string $subscriberId,
+        string $billingDay,
+        string $status,
+        ?int $maxAttemptCount = null,
+    ): ?array {
+        $sql = 'SELECT id, external_trx_id, amount, currency, attempt_count
+                  FROM charge_attempts
+                 WHERE subscriber_id = ? AND billing_day = ? AND status = ?';
+        $params = [$subscriberId, $billingDay, $status];
+        if ($maxAttemptCount !== null) {
+            // A maxed-out transient attempt is never replayed, even if its
+            // next_retry_at is manually forced into the past.
+            $sql .= ' AND attempt_count < ?';
+            $params[] = $maxAttemptCount;
+        }
+        $sql .= ' LIMIT 1';
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        return $row === false ? null : $row;
+    }
+
+    /**
+     * @param array<string, mixed> $attempt
+     * @return array<string, mixed>
+     */
+    private function replayAttempt(
+        string $subscriberId,
+        array $attempt,
+        Clock $clock,
+        bool $recovery,
+    ): array {
+        // Re-check ACTIVE under the row lock before touching a retry/recovery.
+        $this->pdo->beginTransaction();
+        try {
+            $stmt = $this->pdo->prepare('SELECT status FROM subscribers WHERE id = ? FOR UPDATE');
+            $stmt->execute([$subscriberId]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            $this->pdo->commit();
+            if ($row === false || ($row['status'] ?? null) !== 'ACTIVE') {
+                return ['subscriberId' => $subscriberId, 'outcome' => 'skipped', 'reason' => 'not_active'];
+            }
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
+
+        $attemptId = (int) $attempt['id'];
+        $externalTrxId = (string) $attempt['external_trx_id'];
+        $amount = (string) $attempt['amount'];
+        $currency = (string) $attempt['currency'];
+
+        if (!$recovery) {
+            // Re-arm to 'pending' so the same guarded finalize UPDATEs apply.
+            $this->pdo->beginTransaction();
+            try {
+                $stmt = $this->pdo->prepare(
+                    "UPDATE charge_attempts
+                        SET status = 'pending', next_retry_at = NULL, updated_at = now()
+                      WHERE id = ? AND status = 'failed_transient'"
+                );
+                $stmt->execute([$attemptId]);
+                if ($stmt->rowCount() === 0) {
+                    $this->pdo->rollBack();
+
+                    return ['subscriberId' => $subscriberId, 'outcome' => 'race_lost', 'attemptId' => $attemptId];
+                }
+                $this->pdo->commit();
+            } catch (\Throwable $e) {
+                if ($this->pdo->inTransaction()) {
+                    $this->pdo->rollBack();
+                }
+                throw $e;
+            }
+        }
+
+        try {
+            $response = $this->platform->directDebit(
+                $externalTrxId,
+                $subscriberId,
+                $amount,
+                $currency,
+            );
+        } catch (\Throwable) {
+            $this->log->warning('retry transport error, attempt left pending', [
+                'attemptId' => $attemptId,
+                'externalTrxId' => $externalTrxId,
+            ]);
+
+            return [
+                'subscriberId' => $subscriberId,
+                'outcome' => 'error',
+                'reason' => 'transport',
+                'attemptId' => $attemptId,
+                'recovery' => $recovery,
+            ];
+        }
+
+        $code = isset($response['statusCode']) && is_string($response['statusCode'])
+            ? $response['statusCode']
+            : 'UNKNOWN';
+        $detail = isset($response['statusDetail']) && is_string($response['statusDetail'])
+            ? $response['statusDetail']
+            : '';
+
+        switch ($code) {
+            case 'S1000':
+                $result = $this->finalizeCharged($subscriberId, $attemptId, $response, $detail, $amount, $currency);
+                break;
+
+            case 'E1337':
+                $this->pdo->beginTransaction();
+                try {
+                    $this->attempts->markAlreadyCharged($attemptId, $code);
+                    $this->pdo->commit();
+                } catch (\Throwable $e) {
+                    if ($this->pdo->inTransaction()) {
+                        $this->pdo->rollBack();
+                    }
+                    throw $e;
+                }
+                $result = ['subscriberId' => $subscriberId, 'outcome' => 'already_charged', 'attemptId' => $attemptId];
+                break;
+
+            case 'E1308':
+                $this->pdo->beginTransaction();
+                try {
+                    $this->attempts->markFailedPermanent($attemptId, $code, $detail);
+                    $stmt = $this->pdo->prepare(
+                        "UPDATE subscribers
+                            SET status = 'SUSPENDED', last_charge_error = 'E1308', updated_at = now()
+                          WHERE id = ?"
+                    );
+                    $stmt->execute([$subscriberId]);
+                    $this->pdo->commit();
+                } catch (\Throwable $e) {
+                    if ($this->pdo->inTransaction()) {
+                        $this->pdo->rollBack();
+                    }
+                    throw $e;
+                }
+                $result = ['subscriberId' => $subscriberId, 'outcome' => 'suspended', 'attemptId' => $attemptId];
+                break;
+
+            case 'E1326':
+            case 'E1318':
+                $result = $this->finalizeTransient($subscriberId, $attemptId, $code, $detail, $clock);
+                break;
+
+            default:
+                $this->log->warning('unknown retry status code, treating as transient', [
+                    'attemptId' => $attemptId,
+                    'statusCode' => $code,
+                ]);
+                $result = $this->finalizeTransient($subscriberId, $attemptId, $code, $detail, $clock, '+1 hour');
+                break;
+        }
+
+        $result['recovery'] = $recovery;
+
+        return $result;
     }
 }

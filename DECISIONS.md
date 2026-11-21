@@ -10,15 +10,22 @@
 
 ## Retry policy
 - `S1000` terminal-ok → mark charged, store referenceId, send receipt; `E1337` terminal-ok → mark `already_charged`, no retry, no receipt (we cannot know the original referenceId); `E1308` terminal-fail → `status='SUSPENDED'`, no retry; `E1326` and `E1318` transient → `failed_transient` with attempt_count+1 and a scheduled `next_retry_at`, subscriber stays ACTIVE with `last_charge_error`.
-- Backoff is persistent in `charge_attempts`: current count 0 → +15 minutes, 1 → +1 hour, count >= 2 → no further schedule (max 3 attempts total). Retries reuse the SAME `externalTrxId`. Execution of due attempts is deliberately deferred to Iteration 7a — this iteration only records the schedule.
+- Backoff is persistent in `charge_attempts`: current count 0 → +15 minutes, 1 → +1 hour, count >= 2 → no further schedule (max 3 attempts total). Retries reuse the SAME `externalTrxId`. Due attempts are now executed by `POST /jobs/daily-charge` (see Iteration 7a below); after the 3rd failure the subscriber stays ACTIVE with `last_charge_error` and no further retry is scheduled.
 
 ## Iteration 6 (charge core)
 - Currency is read from the existing `CURRENCY` env var (not `DAILY_CURRENCY`), per clarification; the receipt message interpolates `amount()` and `currency()` from config, so it stays consistent with the configured daily fee.
 - The `+4 hours` backoff slot in the instruction is unreachable under the explicit `attemptCount >= 2` stop rule; I followed the explicit rule (3 attempts total: 15m, then 1h, then stop) and flagged this in the report.
 - The Platform call is a real second debit request on crash recovery (the mock's `auto-dup` answers `E1337`), so the debit log has two entries with the same `externalTrxId`; it is not a second charge and produces no second receipt.
 
+## Iteration 7a (retry execution)
+- Retry execution strategy: due retries are processed inside the same `POST /jobs/daily-charge` endpoint. The job selects `failed_transient` rows with `next_retry_at <= now()`, re-arms them to `pending` in a short transaction, and calls `ChargeService::executeRetry()`, which reuses the stored attempt row, `attempt_count` and `external_trx_id` and applies the identical classification helpers as a new charge.
+- Recovery of pending attempts: re-sends the SAME `externalTrxId` (relies on platform idempotency / `E1337`) via `executeRecovery()`; it never mints a new id. Terminal conflicts are not replayed, and a recovered `S1000` still goes through the same receipt path.
+- After a maxed-out transient retry (attempt_count 3) the attempt stays `failed_transient` with NULL `next_retry_at` and the subscriber stays ACTIVE, per your clarification; this keeps the next billing day a fresh charge.
+
 ## Opt-out vs charge race
-TBD — describe SELECT ... FOR UPDATE and the status re-check.
+- Opt-out race: `SELECT ... FOR UPDATE` on the subscriber plus the `status = 'ACTIVE'` re-check inside that lock guarantees STOP wins over a concurrent charge. Whichever transaction acquires the row first decides; a charge that obtains the lock after STOP sees INACTIVE and skips without calling the Platform.
+- When opting out, pending retries have `next_retry_at` set to NULL (and `failed_transient` rows stay non-due), so a stopped subscriber can never be revived by the retry phase — which also re-checks ACTIVE under the row lock.
+- Opt-out itself is idempotent: an already-INACTIVE subscriber returns without a second Platform `action:"0"` or goodbye SMS; a Platform failure never marks the subscriber INACTIVE.
 
 ## Skipped / known gaps
 TBD — be honest.
