@@ -58,7 +58,8 @@ services:
       APP_ENV: ${APP_ENV:-local}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       PLATFORM_BASE_URL: ${PLATFORM_BASE_URL:-http://platform-mock:8080}
-      SERVICE_BASE_URL: ${SERVICE_BASE_URL:-http://service:8080}
+      PLATFORM_APP_ID: ${PLATFORM_APP_ID:-APP_000123}
+      SERVICE_CALLBACK_URL: ${SERVICE_CALLBACK_URL:-http://service:8080/webhooks/subscription}
     ports:
       - "8081:8080"
     healthcheck:

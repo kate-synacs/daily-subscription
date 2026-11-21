@@ -1,16 +1,18 @@
 FROM php:8.3-cli-alpine
 
-RUN apk add --no-cache bash curl
+RUN apk add --no-cache curl
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 WORKDIR /app
 
-COPY composer.json composer.lock* ./
-RUN if [ -f composer.json ]; then composer install --no-interaction --prefer-dist --no-progress || true; fi
+COPY composer.json composer.lock ./
+COPY src/ src/
+COPY public/ public/
 
-COPY . .
+RUN composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist --no-progress
 
+COPY entrypoint.sh ./
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8080
